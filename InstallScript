@@ -1,0 +1,788 @@
+#!/bin/bash
+
+openflag=0
+atlasflag=0
+gpuflag=1
+
+set -- `getopt -n$0 -u -a --longoptions="prefix=: cuda-home=: with-atlas with-openblas no-gpu help" "h" "$@"`
+
+usage()
+{
+cat << EOF
+usage: $0 options
+
+Install Script for HiPLARM downloading and building the following libraries
+1: OpenBLAS or ATLAS - Optimised versions of BLAS and LAPACK
+2: Hwloc - Software that finds system architecture
+3: PLASMA - Linear Algebra Routines for multi-core libraries
+4: MAGMA (Optional) - If the user has an NVIDIA GPU and CUDA libraries then the script will build the MAGMA library
+5: HiPLARM - R Package for multi-core and GPU computing
+
+OPTIONS:
+	-h|--help		Help Command
+	--prefix=PREFIX		Install libraries in PREFIX
+	--cuda-home=CUDADIR   	Directory of CUDA installation
+	--with-openblas		Give this flag if the user wishes to install OpenBLAS
+	--with-atlas		Give this flag if the user wishes to use ATLAS
+	--no-gpu		If the user does not have a GPU or wish to build without GPU support
+	
+e.g No GPU support, Multi-core CPU support Only 
+	./InstallScript --with-openblas --no-gpu
+e.g With GPU support and user defined install directory
+	./InstallScript --prefix=/home/jsmyth/mylibraries --cuda-home=/usr/local/cuda --with-atlas
+
+EOF
+}
+
+while [ $# -gt 0 ]
+do
+	    case "$1" in
+		      --prefix=)   BLDDIR=$2;shift;;
+			--cuda-home=) CUDADIR=$2;shift;;
+			--with-openblas) openflag=1;;
+			--with-atlas) atlasflag=1;;
+			--no-gpu) gpuflag=0;;
+			-h|--help)	usage
+					exit 1;;
+			--)        break;;
+			-*)        usage;;
+			*)         break;;            #better be the crawl directory
+			esac	
+			shift
+done
+
+if [ $atlasflag = $openflag ]
+then
+	echo "You have not decided which optimised BLAS library to use or chosen both"
+
+	echo "Please choose A for ATLAS or O for OpenBLAS: "
+	while :
+	do
+	
+	read input_variable
+	if [ "$input_variable" = "A" ] || [ "$input_variable" = "a" ]
+	then
+		echo "Compiling using ATLAS"
+		atlasflag=1
+		openflag=0
+		break
+	elif [ "$input_variable" = "O" ] || [ "$input_variable" = "o" ]
+	then
+		echo "Compiling with OpenBLAS"
+		atlasflag=0
+		openflag=1
+		break
+	else 
+		echo "Please Enter O or A"
+	fi
+	done
+
+fi
+
+if [ -z $BLDDIR ]
+then
+	BLDDIR=$PWD/LALibs
+fi
+
+if [ -d "$BLDDIR" ]
+then
+	cd $BLDDIR
+else
+	mkdir -p $BLDDIR
+	cd $BLDDIR
+fi
+
+if [ -f "$CUDADIR/lib64/libcudart.so" -a "$CUDADIR/lib64/libcublas.so" ] 
+then
+	BIT64=true 
+	BIT32=false
+	echo "Found 64 bit CUDA libraries"
+	CUDALIB=$CUDADIR/lib64
+else 
+	echo "64 bit cuda libraries not found. Checking 32bit ....."
+	if [ -f "$CUDADIR/lib/libcudart.so" -a "$CUDADIR/lib/libcublas.so" ]
+	then
+		BIT32=true
+		BIT64=false
+		CUDALIB=$CUDADIR/lib
+		echo "Found 32 bit CUDA libraries"
+	else 
+		echo "CUDA libraries not found do you wish to continue without GPU support y/n "
+		while :
+		do
+	
+			read input_variable
+			if [ "$input_variable" = "y" ] || [ "$input_variable" = "Y" ]
+			then
+				echo "Continuing without GPU support"
+				gpuflag=0
+				break
+			elif [ "$input_variable" = "n" ] || [ "$input_variable" = "N" ]
+			then
+				echo "Exiting Install script"
+			exit
+			break
+		else 
+			echo "Please Enter y or n"
+		fi
+	done
+	fi
+fi
+
+
+if [ ! -d "$BLDDIR/lib" ]
+then
+mkdir lib
+fi
+if [ ! -d "$BLDDIR/include" ]
+then
+mkdir include
+fi
+
+if [ $gpuflag = 1 ]
+then
+echo "Building with GPU support"
+echo "CUDA install directory is $CUDADIR"
+fi
+
+if [ $atlasflag = 1 ]
+then
+	echo "Building with ATLAS"
+	echo "For successful ATLAS build CPU throttling must be turned off
+For more information see http://www.hiplar.org/hiplar-M-installation.html#ATLAS
+do you wish to continue y/n"
+		while :
+		do
+
+			read input_variable
+			if [ "$input_variable" = "y" ] || [ "$input_variable" = "Y" ]
+			then
+				echo "Continuing with ATLAS install"
+				atlasflag=1
+				break
+			elif [ "$input_variable" = "n" ] || [ "$input_variable" = "N" ]
+			then
+				echo "Exiting Install script"
+			exit
+			break
+		else 
+			echo "Please Enter y or n"
+		fi
+	done
+	
+fi
+
+if [ $openflag = 1 ]
+then
+	echo "Building with OpenBLAS"
+fi
+
+echo "Build Directory is $BLDDIR"
+
+
+
+LIBDIR=$BLDDIR/lib
+INCDIR=$BLDDIR/include
+INSTALLLOG=$BLDDIR/install.log
+ERRLOG=$BLDDIR/error.log
+
+NUM_PHYS_CPU=`cat /proc/cpuinfo | grep 'physical id' | sort | uniq | wc -l`
+NUM_CORES=`cat /proc/cpuinfo | grep 'cpu cores' | uniq | sed 's/[a-z]//g' | sed 's/://g'`
+
+let TOTAL_CORES=$[NUM_PHYS_CPU * NUM_CORES]
+
+echo "Found $TOTAL_CORES system cores"
+if [ ! -d $CUDADIR ]
+	then
+		echo "$CUDADIR does not exist, building without GPU support"
+		gpuflag=0
+	fi
+sleep 5
+
+if [ $openflag = 1 ]
+then
+	echo "Building pre-requisite libraries with OpenBLAS" >$INSTALLLOG
+
+	if [ ! -f "$LIBDIR/libhwloc.la" ]
+	then
+
+
+		##### Start off by install hwloc ##########
+		if [ ! -f "$BLDDIR/hwloc-1.7.2.tar.gz" ]
+		then
+			echo "Downloading hwloc version 1.7.2 ....."
+			wget http://www.open-mpi.org/software/hwloc/v1.7/downloads/hwloc-1.7.2.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+		else 
+			echo "hwloc tar file found, skipping download....."
+		fi
+	
+		if [ ! -d "$BLDDIR/hwloc-1.7.2" ]
+		then
+			tar -xf hwloc-1.7.2.tar.gz 2>>$ERRLOG
+		fi
+
+		cd hwloc-1.7.2
+		
+		echo "Building hwloc..... Please wait"
+		./configure --prefix="$BLDDIR" >$INSTALLLOG 2>>$ERRLOG
+		make -j $NUM_CORES >>$INSTALLLOG 2>>$ERRLOG
+		make install >>$INSTALLLOG 2>>$ERRLOG
+	
+		export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$LIBDIR/pkgconfig
+		export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LIBDIR
+		if [ -f "$LIBDIR/libhwloc.la" ]
+		then
+			echo "hwloc build completed successfully"
+			sleep 1
+		else
+			echo "hwloc build failed. Please see install.log and error.log files. Exiting"
+			exit
+		fi	
+	else
+		echo "Version of hwloc detected, skipping this step"
+	fi
+
+	##### Done #############
+
+	cd $BLDDIR
+
+	## Now install our optimised BLAS, OpenBLAS is easiest for this ################
+	if [ ! -f "$LIBDIR/libopenblas.so" ]
+	then
+
+		
+		if [ ! -f "$BLDDIR/OpenBLAS.tar.gz" ]	
+		then
+			echo "Downloading OpenBLAS....."
+			wget -O - https://github.com/xianyi/OpenBLAS/tarball/master > OpenBLAS.tar.gz 2>>$ERRLOG
+		else 
+			echo "OpenBLAS tar file found, skipping download....."
+		fi
+
+		tar -xf OpenBLAS.tar.gz 2>>$ERRLOG
+
+		cd xianyi*
+		sed -i 's/# NO_AFFINITY = 1/NO_AFFINITY = 1/' Makefile.rule
+		
+		echo "Building OpenBLAS..... Please wait"
+		
+		make -j $NUM_CORES >>$INSTALLLOG 2>>$ERRLOG
+		make PREFIX=$BLDDIR install >>$INSTALLLOG 2>>$ERRLOG
+		
+		export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LIBDIR
+		if [ -f "$LIBDIR/libopenblas.so" ]
+		then	
+			echo "OpenBLAS build completed successfully"
+			sleep 1
+		else
+			echo "OpenBLAS build failed. Please see install.log file. Exiting"	
+			exit
+		fi
+	else
+		echo "Version of OpenBLAS detected, skipping this step....."
+	fi
+	#### Done #############################
+
+	cd $BLDDIR
+
+	### Now for PLASMA #############
+	
+	if [ ! -f "$LIBDIR/libplasma.so" ] || [ ! -f "$LIBDIR/libquark.so" ] || [ ! -f "$LIBDIR/libcoreblas.so" ] || [ ! -f "$LIBDIR/libcoreblasqw.so" ]
+	then
+
+		if [ ! -f "$BLDDIR/plasma-installer_2.6.0.tar.gz" ]
+		then
+			wget http://icl.cs.utk.edu/projectsfiles/plasma/pubs/plasma-installer_2.6.0.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+		else
+			echo "PLASMA tar file found, skipping download....."
+		fi
+
+		if [ ! -d "$BLDDIR/plasma-installer_2.6.0.tar.gz" ]
+		then
+			tar -xf plasma-installer_2.6.0.tar.gz 2>>$ERRLOG
+		fi
+		cd plasma-installer_2.6.0
+	
+		export OPENBLAS_NUM_THREADS=1
+
+		echo "Building PLASMA..... Please wait"
+		./setup.py --prefix="$BLDDIR" --blaslib="-L$BLDDIR/lib -lopenblas" --cflags="-O3 -fPIC" --fflags="-O3 -fPIC" --noopt="-fPIC" --notesting --downlapc >> $INSTALLLOG 2>>$ERRLOG
+
+		cd $LIBDIR
+
+		gcc -shared -o libplasma.so -Wl,-whole-archive libplasma.a -Wl,-no-whole-archive -L. -lhwloc -llapacke >> $INSTALLLOG 2>>$ERRLOG
+		gcc -shared -o libcoreblas.so -Wl,-whole-archive libcoreblas.a -Wl,-no-whole-archive -L. -llapacke >> $INSTALLLOG 2>>$ERRLOG
+		gcc -shared -o libquark.so -Wl,-whole-archive libquark.a -Wl,-no-whole-archive >> $INSTALLLOG 2>>$ERRLOG
+		gcc -shared -o libcoreblasqw.so -Wl,-whole-archive libcoreblasqw.a -Wl,-no-whole-archive -L. -llapacke >> $INSTALLLOG 2>>$ERRLOG
+
+
+		export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$LIBDIR/pkgconfig
+		export PLASMA_NUM_THREADS=$TOTAL_CORES
+		export R_PLASMA_NUM_THREADS=$TOTAL_CORES
+		if [ -f "$LIBDIR/libplasma.so" ] && [ -f "$LIBDIR/libcoreblas.so" ] && [ -f "$LIBDIR/libquark.so" ] && [ -f "$LIBDIR/libcoreblasqw.so" ]
+		then
+ 			echo "PLASMA build completed successfully"
+			sleep 1
+		else
+			echo "PLASMA build failed. Please see install.log file. Exiting"
+			exit
+		fi	
+	else
+		echo "Dynamic version of PLASMA library detected. Skipping compilation....."
+	fi
+	####### Done ##########
+	
+	cd $BLDDIR
+
+	if [ $gpuflag = 1 ]
+	then
+		export PKG_CONFIG_PATH=''
+		if [ ! -f "$LIBDIR/libmagma.so" ]
+		then
+			echo "Downloading and building shared version of MAGMA libraries"
+			
+			if [ ! -f "$BLDDIR/magma-1.4.1.tar.gz" ]
+			then
+				echo "Dowloading MAGMA version 1.4.1 ....."
+				wget http://icl.cs.utk.edu/projectsfiles/magma/downloads/magma-1.4.1.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+			else
+				echo "MAGMA tar file found, skipping download....."
+			fi
+
+			tar -xf magma-1.4.1.tar.gz
+			cd magma-1.4.1
+
+
+echo "#include<cuda.h>
+#include<cuda_runtime_api.h>
+#include<stdio.h>
+
+int main() {
+
+	int deviceCount = 0;
+	cudaError_t error_id = cudaGetDeviceCount(&deviceCount);
+
+	int dev, driverVersion = 0, runtimeVersion = 0;
+	struct cudaDeviceProp deviceProp;	
+	int prev = 0;
+
+	for (dev = 0; dev < deviceCount; dev++) {	
+		cudaGetDeviceProperties(&deviceProp, dev);
+		if(deviceProp.major > prev)
+			prev = deviceProp.major;
+		}
+		if(prev >= 2 && prev < 3)
+			printf(\"GPU_TARGET = Fermi\");
+		else if(prev >= 3)
+			printf(\"GPU_TARGET = Kepler\");
+		else
+			printf(\"GPU_TARGET = Tesla\");
+
+			return 0;
+}
+" > getDevice.c
+			export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDALIB
+			gcc getDevice.c -I$CUDADIR/include -o getDevice -L$CUDALIB -lcudart 2>>$ERRLOG
+			./getDevice > make.inc 2>>$ERRLOG
+
+echo "
+
+#//////////////////////////////////////////////////////////////////////////////
+#   -- MAGMA (version 1.2.1) --
+#      Univ. of Tennessee, Knoxville
+#      Univ. of California, Berkeley
+#      Univ. of Colorado, Denver
+#      June 2012
+#
+#      Contributed by: Allan Menezes (Ontario, Canada)
+#//////////////////////////////////////////////////////////////////////////////
+
+#
+# GPU_TARGET specifies for which GPU you want to compile MAGMA:
+#     Tesla (NVIDIA compute capability 1.x cards)
+#     Fermi (NVIDIA compute capability 2.x cards)
+# See http://developer.nvidia.com/cuda-gpus
+
+CC        = gcc
+NVCC      = $CUDADIR/bin/nvcc
+FORT      = gfortran
+
+ARCH      = ar
+ARCHFLAGS = cr
+RANLIB    = ranlib
+
+OPTS      = -fPIC -O3 -DADD_ -Wall -fno-strict-aliasing -fopenmp -DMAGMA_SETAFFINITY
+F77OPTS   = -fPIC -O3 -DADD_ -Wall
+FOPTS     = -fPIC -O3 -DADD_ -Wall -x f95-cpp-input
+NVOPTS    = -O3 -DADD_ -Xcompiler -fno-strict-aliasing,-fPIC
+LDOPTS    = -fPIC -fopenmp
+
+# gcc with MKL 10.3, Intel threads
+LIB       = -lopenblas -lpthread -lcublas -lcudart -lstdc++ -lm -lgfortran
+
+CUDADIR   = $CUDADIR
+
+LIBDIR    = -L$LIBDIR -L$CUDALIB
+INC       = -I$CUDADIR/include
+		" >> make.inc
+	
+			make -j $NUM_CORES shared >>$INSTALLLOG 2>>$ERRLOG
+
+			cd lib
+			cp *.so $LIBDIR
+			cd ../
+			cp include/*.h $BLDDIR/include/
+			
+			if [ -f "$LIBDIR/libmagma.so" ]
+			then
+				echo "Shared MAGMA libraries built successfully"
+				sleep 1
+			else
+				echo "MAGMA build failed. 
+Please see $INSTALLLOG
+and $ERRLOG files.
+Exiting............"
+				exit
+			fi	
+		else
+			echo "Shared version of MAGMA library detected. Skipping this step...."
+		fi 
+	fi		
+
+	cd $BLDDIR
+
+	if [ ! -f HiPLARM_0.1.1.tar.gz ]
+	then
+		wget http://www.hiplar.org/downloads/HiPLARM_0.1.1.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+	fi
+	
+	if [ $gpuflag = 1 ]
+	then
+		R CMD INSTALL --configure-args="--with-lapack=-L$LIBDIR\ -lopenblas --with-plasma-lib=$BLDDIR --with-cuda-home=$CUDADIR --with-magma-lib=$BLDDIR" HiPLARM_0.1.1.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+	fi
+		
+	if [ $gpuflag = 0 ]
+	then
+		R CMD INSTALL --configure-args="--with-lapack=-L$LIBDIR\ -lopenblas --with-plasma-lib=$BLDDIR" HiPLARM_0.1.1.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+	fi
+
+fi
+
+if [ $atlasflag = 1 ]
+then
+	cd $BLDDIR
+		
+	##### Start off by install hwloc ##########
+	if [ ! -f "$LIBDIR/libhwloc.la" ]
+	then
+		##### Start off by install hwloc ##########
+		if [ ! -f "$BLDDIR/hwloc-1.7.2.tar.gz" ]
+		then
+			echo "Downloading hwloc version 1.7.2 ....."
+			wget http://www.open-mpi.org/software/hwloc/v1.7/downloads/hwloc-1.7.2.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+		else 
+			echo "hwloc tar file found, skipping download....."
+		fi
+	
+		if [ ! -d "$BLDDIR/hwloc-1.7.2" ]
+		then
+			tar -xf hwloc-1.7.2.tar.gz 2>>$ERRLOG
+		fi
+
+		cd hwloc-1.7.2
+		
+		echo "Building hwloc..... Please wait"
+		./configure --prefix="$BLDDIR" >$INSTALLLOG 2>>$ERRLOG
+		make -j $NUM_CORES >>$INSTALLLOG 2>>$ERRLOG
+		make install >>$INSTALLLOG 2>>$ERRLOG
+	
+		export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$LIBDIR/pkgconfig
+		export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LIBDIR
+		if [ -f "$LIBDIR/libhwloc.la" ]
+		then
+			echo "hwloc build completed successfully"
+			sleep 1
+		else
+			echo "hwloc build failed. Please see install.log and error.log files. Exiting"
+			exit
+		fi	
+	else
+		echo "Version of hwloc detected, skipping this step"
+	fi
+	### Done #############
+
+	cd $BLDDIR
+																						
+	### Now get ATLAS ###
+	if [ ! -f "$LIBDIR/libsatlas.so" ]
+	then
+		if [ ! -f "$BLDDIR/atlas3.10.1.tar.bz2" ]
+		then
+			echo "Downloading ATLAS version 3.10.1"
+			wget http://sourceforge.net/projects/math-atlas/files/Stable/3.10.1/atlas3.10.1.tar.bz2 >>$INSTALLLOG 2>>$ERRLOG
+		else 
+			echo "ATLAS tar file found, skipping download....."
+		fi
+
+		if [ ! -f "$BLDDIR/ATLAS" ]
+		then
+			tar -xf atlas3.10.1.tar.bz2
+		fi
+
+		if [ ! -f "$BLDDIR/lapack-3.4.2.tgz" ]
+		then
+			echo "Downloading LAPACK version 3.4.2!"
+			wget http://www.netlib.org/lapack/lapack-3.4.2.tgz >>$INSTALLLOG 2>>$ERRLOG
+		else
+			echo "LAPACK tar file found, skipping download....."
+		fi
+
+		cd ATLAS
+		
+		if [ ! -d "build" ]
+		then
+			mkdir build
+		fi
+	
+		echo "Building ATLAS libraries"
+		cd build
+		../configure --prefix="$BLDDIR" --shared --with-netlib-lapack-tarfile="$BLDDIR/lapack-3.4.2.tgz" >>$INSTALLLOG 2>>$ERRLOG
+		make -j $NUM_CORES >>$INSTALLLOG 2>>$ERRLOG
+		make install >>$INSTALLLOG 2>>$ERRLOG
+		
+		if [ -f "$LIBDIR/libsatlas.so" ]
+		then
+			echo "ATLAS libraries compiled successfully"
+		else
+			echo "ATLAS libraries not compiled successfully. Exiting"
+			exit
+		fi	
+	else
+		echo "Shared version of ATLAS libraries detected, skipping this step"
+	fi
+	
+	cd $BLDDIR
+	
+	export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$LIBDIR
+
+	### Now for PLASMA #############
+	if [ ! -f "$LIBDIR/libplasma.so" ] || [ ! -f "$LIBDIR/libquark.so" ] || [ ! -f "$LIBDIR/libcoreblas.so" ] || [ ! -f "$LIBDIR/libcoreblasqw.so" ]
+	then
+
+		if [ ! -f "$BLDDIR/plasma-installer_2.6.0.tar.gz" ]
+		then
+			wget http://icl.cs.utk.edu/projectsfiles/plasma/pubs/plasma-installer_2.6.0.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+		else
+			echo "PLASMA tar file found, skipping download....."
+		fi
+
+		if [ ! -d "$BLDDIR/plasma-installer_2.6.0.tar.gz" ]
+		then
+			tar -xf plasma-installer_2.6.0.tar.gz 2>>$ERRLOG
+		fi
+		cd plasma-installer_2.6.0
+	
+		export OPENBLAS_NUM_THREADS=1
+
+		echo "Building PLASMA..... Please wait"
+		./setup.py --prefix="$BLDDIR" --blaslib="-L$BLDDIR/lib -lsatlas" --cflags="-O3 -fPIC" --fflags="-O3 -fPIC" --noopt="-fPIC" --notesting --downlapc >> $INSTALLLOG 2>>$ERRLOG
+
+		cd $LIBDIR
+
+		gcc -shared -o libplasma.so -Wl,-whole-archive libplasma.a -Wl,-no-whole-archive -L. -lhwloc -llapacke >> $INSTALLLOG 2>>$ERRLOG
+		gcc -shared -o libcoreblas.so -Wl,-whole-archive libcoreblas.a -Wl,-no-whole-archive -L. -llapacke >> $INSTALLLOG 2>>$ERRLOG
+		gcc -shared -o libquark.so -Wl,-whole-archive libquark.a -Wl,-no-whole-archive >> $INSTALLLOG 2>>$ERRLOG
+		gcc -shared -o libcoreblasqw.so -Wl,-whole-archive libcoreblasqw.a -Wl,-no-whole-archive -L. -llapacke>> $INSTALLLOG 2>>$ERRLOG
+
+
+		export PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$LIBDIR/pkgconfig
+		export PLASMA_NUM_THREADS=$TOTAL_CORES
+		export R_PLASMA_NUM_THREADS=$TOTAL_CORES
+		if [ -f "$LIBDIR/libplasma.so" ] && [ -f "$LIBDIR/libcoreblas.so" ] && [ -f "$LIBDIR/libquark.so" ] && [ -f "$LIBDIR/libcoreblasqw.so" ]
+		then
+ 			echo "PLASMA build completed successfully"
+			sleep 1
+		else
+			echo "PLASMA build failed. Please see install.log file. Exiting"
+			exit
+		fi	
+	else
+		echo "Dynamic version of PLASMA library detected. Skipping compilation....."
+	fi
+	
+	####
+	
+	cd $BLDDIR
+
+	if [ $gpuflag = 1 ]
+	then
+		export PKG_CONFIG_PATH=""
+		if [ ! -f "$LIBDIR/libmagma.so" ]
+		then
+			echo "Downloading and building shared version of MAGMA libraries"
+			
+			if [ ! -f "$BLDDIR/magma-1.4.1.tar.gz" ]
+			then
+				echo "Dowloading MAGMA version 1.4.1 ....."
+				wget http://icl.cs.utk.edu/projectsfiles/magma/downloads/magma-1.4.1.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+			else
+				echo "MAGMA tar file found, skipping download....."
+			fi
+
+			tar -xf magma-1.4.1.tar.gz
+			cd magma-1.4.1
+
+
+echo "#include<cuda.h>
+#include<cuda_runtime_api.h>
+#include<stdio.h>
+
+int main() {
+
+	int deviceCount = 0;
+	cudaError_t error_id = cudaGetDeviceCount(&deviceCount);
+
+	int dev, driverVersion = 0, runtimeVersion = 0;
+	struct cudaDeviceProp deviceProp;	
+	int prev = 0;
+
+	for (dev = 0; dev < deviceCount; dev++) {	
+		cudaGetDeviceProperties(&deviceProp, dev);
+		if(deviceProp.major > prev)
+			prev = deviceProp.major;
+		}
+		if(prev >= 2 && prev < 3)
+			printf(\"GPU_TARGET = Fermi\");
+		else if(prev >= 3)
+			printf(\"GPU_TARGET = Kepler\");
+		else
+			printf(\"GPU_TARGET = Tesla\");
+
+			return 0;
+}
+" > getDevice.c
+			export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDALIB
+			gcc getDevice.c -I$CUDADIR/include -o getDevice -L$CUDALIB -lcudart 2>>$ERRLOG
+			./getDevice > make.inc 2>>$ERRLOG
+
+echo "
+
+#//////////////////////////////////////////////////////////////////////////////
+#   -- MAGMA (version 1.2.1) --
+#      Univ. of Tennessee, Knoxville
+#      Univ. of California, Berkeley
+#      Univ. of Colorado, Denver
+#      June 2012
+#
+#      Contributed by: Allan Menezes (Ontario, Canada)
+#//////////////////////////////////////////////////////////////////////////////
+
+#
+# GPU_TARGET specifies for which GPU you want to compile MAGMA:
+#     Tesla (NVIDIA compute capability 1.x cards)
+#     Fermi (NVIDIA compute capability 2.x cards)
+# See http://developer.nvidia.com/cuda-gpus
+
+CC        = gcc
+NVCC      = $CUDADIR/bin/nvcc
+FORT      = gfortran
+
+ARCH      = ar
+ARCHFLAGS = cr
+RANLIB    = ranlib
+
+OPTS      = -fPIC -O3 -DADD_ -Wall -fno-strict-aliasing -fopenmp -DMAGMA_SETAFFINITY
+F77OPTS   = -fPIC -O3 -DADD_ -Wall
+FOPTS     = -fPIC -O3 -DADD_ -Wall -x f95-cpp-input
+NVOPTS    = -O3 -DADD_ -Xcompiler -fno-strict-aliasing,-fPIC
+LDOPTS    = -fPIC -fopenmp
+
+LIB       = -lsatlas -lpthread -lcublas -lcudart -lstdc++ -lm -lgfortran
+
+ATLASDIR  = $LIBDIR
+
+CUDADIR   = $CUDADIR
+
+LIBDIR    = -L$LIBDIR -L$CUDALIB
+INC       = -I$CUDADIR/include
+		" >> make.inc
+	
+			make -j $NUM_CORES shared >>$INSTALLLOG 2>>$ERRLOG
+
+			cd lib
+			cp *.so $LIBDIR
+			cd ../
+			cp include/*.h $BLDDIR/include/
+			
+			if [ -f "$LIBDIR/libmagma.so" ]
+			then
+				echo "Shared MAGMA libraries built successfully"
+				sleep 1
+			else
+				echo "MAGMA build failed. 
+Please see $INSTALLLOG
+and $ERRLOG files.
+Exiting............"
+				exit
+			fi	
+		else
+			echo "Shared version of MAGMA library detected. Skipping this step...."
+		fi 
+	fi	
+#### MAGMA Completed #####
+cd $BLDDIR
+
+	if [ ! -f HiPLARM_0.1.1.tar.gz ]
+	then
+		wget http://www.hiplar.org/downloads/HiPLARM_0.1.1.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+	fi
+
+	if [ $gpuflag = 1 ]
+	then
+		R CMD INSTALL --configure-args="--with-lapack=-L$LIBDIR\ -lsatlas --with-plasma-lib=$BLDDIR --with-cuda-home=$CUDADIR --with-magma-lib=$BLDDIR" HiPLARM_0.1.1.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+	fi
+		
+	if [ $gpuflag = 0 ]
+	then
+		R CMD INSTALL --configure-args="--with-lapack=-L$LIBDIR\ -lsatlas --with-plasma-lib=$BLDDIR" HiPLARM_0.1.1.tar.gz >>$INSTALLLOG 2>>$ERRLOG
+	fi
+
+
+
+fi
+
+export R_PLASMA_NUM_THREADS=$TOTAL_CORES
+if [ $gpuflag = 1 ]
+then
+echo "##Creating Optimise Script##
+library(HiPLARM)
+OptimiseAll()
+" > optimiseScript.R
+
+Rscript optimiseScript.R
+rm optimiseScript.R
+
+fi
+
+#cleaning up
+echo "Cleaning up....."
+
+rm *.tar.gz 2> /dev/null
+rm -rf magma-1.4.1 2> /dev/null
+rm -r plasma-installer* 2> /dev/null
+rm -r hwloc* 2> /dev/null
+rm *.bz2 2> /dev/null
+rm *.tgz 2> /dev/null
+
+if [ $openflag = 1 ]
+then
+		rm -r xianyi* 2> /dev/null
+fi
+
+if [ $atlasflag = 1 ]
+then
+	if [ -d ATLAS ] || [ -d atlas_3.10.1 ]
+	then
+		rm -r ATLAS 2> /dev/null
+	fi
+fi
